@@ -1,30 +1,45 @@
 package torrent
 
 import (
+	"bytes"
 	"cmp"
+	"context"
 	"fmt"
 	"iter"
+	"log/slog"
 	"maps"
+	"os"
+	"runtime/pprof"
 	"strings"
 	"sync"
+	"time"
 	"unique"
 
 	g "github.com/anacrolix/generics"
 	"github.com/anacrolix/generics/heap"
 	"github.com/anacrolix/missinggo/v2/panicif"
+	"github.com/davecgh/go-spew/spew"
 
 	"github.com/anacrolix/torrent/internal/request-strategy"
 	"github.com/anacrolix/torrent/metainfo"
 	"github.com/anacrolix/torrent/webseed"
 )
 
-const defaultRequestsPerWebseedHost = 10
+var webseedHostRequestConcurrency = initIntFromEnv("TORRENT_WEBSEED_HOST_REQUEST_CONCURRENCY", 10, 0)
 
 type (
 	webseedHostKey       string
 	webseedHostKeyHandle = unique.Handle[webseedHostKey]
-	webseedUrlKey        string
+	webseedUrlKey        unique.Handle[string]
 )
+
+func (me webseedUrlKey) Value() string {
+	return unique.Handle[string](me).Value()
+}
+
+func (me webseedUrlKey) String() string {
+	return me.Value()
+}
 
 /*
 - Go through all the requestable pieces in order of priority, availability, whether there are peer requests, partial, infohash.
@@ -34,8 +49,7 @@ type (
 */
 func (cl *Client) updateWebseedRequests() {
 	type aprioriMapValue struct {
-		// Change to request index?
-		startOffset int64
+		startIndex RequestIndex
 		webseedRequestOrderValue
 	}
 	aprioriMap := make(map[aprioriWebseedRequestKey]aprioriMapValue)
@@ -44,8 +58,7 @@ func (cl *Client) updateWebseedRequests() {
 		if ok {
 			// Shared in the lookup above.
 			t := uniqueKey.t
-			hasPeerConnRequest := func(offset int64) bool {
-				reqIndex := t.getRequestIndexContainingOffset(offset)
+			hasPeerConnRequest := func(reqIndex RequestIndex) bool {
 				return t.requestingPeer(reqIndex) != nil
 			}
 			// Skip the webseed request unless it has a higher priority, is less requested by peer
@@ -53,25 +66,27 @@ func (cl *Client) updateWebseedRequests() {
 			// webseed requests in favour of peer conns unless there's nothing else to do.
 			if cmp.Or(
 				cmp.Compare(value.priority, cur.priority),
-				compareBool(hasPeerConnRequest(cur.startOffset), hasPeerConnRequest(uniqueKey.startOffset)),
-				cmp.Compare(cur.startOffset, uniqueKey.startOffset),
+				compareBool(hasPeerConnRequest(cur.startIndex), hasPeerConnRequest(uniqueKey.startRequest)),
+				cmp.Compare(cur.startIndex, uniqueKey.startRequest),
 			) <= 0 {
 				continue
 			}
 		}
-		aprioriMap[uniqueKey.aprioriWebseedRequestKey] = aprioriMapValue{uniqueKey.startOffset, value}
+		aprioriMap[uniqueKey.aprioriWebseedRequestKey] = aprioriMapValue{uniqueKey.startRequest, value}
 	}
+	// TODO: This should not be keyed on startRequest but only on sliceIndex.
 	existingRequests := maps.Collect(cl.iterCurrentWebseedRequests())
 	// We don't need the value but maybe cloning is just faster anyway?
 	unusedExistingRequests := maps.Clone(existingRequests)
 	type heapElem struct {
 		webseedUniqueRequestKey
 		webseedRequestOrderValue
+		mightHavePartialFiles bool
 	}
 	// Build the request heap, merging existing requests if they match.
 	heapSlice := make([]heapElem, 0, len(aprioriMap)+len(existingRequests))
 	for key, value := range aprioriMap {
-		fullKey := webseedUniqueRequestKey{key, value.startOffset}
+		fullKey := webseedUniqueRequestKey{key, value.startIndex}
 		heapValue := value.webseedRequestOrderValue
 		// If there's a matching existing request, make sure to include a reference to it in the
 		// heap value and deduplicate it.
@@ -90,25 +105,48 @@ func (cl *Client) updateWebseedRequests() {
 		heapSlice = append(heapSlice, heapElem{
 			fullKey,
 			heapValue,
+			fullKey.mightHavePartialFiles(),
 		})
 	}
 	// Add remaining existing requests.
 	for key := range unusedExistingRequests {
-		heapSlice = append(heapSlice, heapElem{key, existingRequests[key]})
+		// Don't reconsider existing requests that aren't wanted anymore.
+		if key.t.dataDownloadDisallowed.IsSet() {
+			continue
+		}
+		heapSlice = append(heapSlice, heapElem{key, existingRequests[key], key.mightHavePartialFiles()})
 	}
 	aprioriHeap := heap.InterfaceForSlice(
 		&heapSlice,
 		func(l heapElem, r heapElem) bool {
-			// Prefer the highest priority, then existing requests, then longest remaining file extent.
-			return cmp.Or(
+			// Not stable ordering but being sticky to existing webseeds should be enough.
+			ret := cmp.Or(
+				// Prefer highest priority
 				-cmp.Compare(l.priority, r.priority),
-				// Existing requests are assigned the priority of the piece they're reading next.
+				// Then existing requests
 				compareBool(l.existingWebseedRequest == nil, r.existingWebseedRequest == nil),
-				// This won't thrash because we already preferred existing requests, so we'll finish out small extents.
-				-cmp.Compare(
-					l.t.Files()[l.fileIndex].length-l.startOffset,
-					r.t.Files()[r.fileIndex].length-r.startOffset),
-			) < 0
+				// Prefer not competing with active peer connections.
+				compareBool(len(l.t.conns) > 0, len(r.t.conns) > 0),
+				// Try to complete partial slices first.
+				-compareBool(l.mightHavePartialFiles, r.mightHavePartialFiles),
+				// No need to prefer longer files anymore now that we're using slices?
+				//// Longer files first.
+				//-cmp.Compare(l.longestFile().Unwrap(), r.longestFile().Unwrap()),
+				// Easier to debug than infohashes...
+				cmp.Compare(l.t.info.Name, r.t.info.Name),
+				bytes.Compare(l.t.canonicalShortInfohash()[:], r.t.canonicalShortInfohash()[:]),
+				// It's possible for 2 heap elements to have the same slice index from the same
+				// torrent, but they'll differ in existingWebseedRequest and be sorted before this.
+				// Doing earlier chunks first means more compact files for partial file hashing.
+				cmp.Compare(l.sliceIndex, r.sliceIndex),
+			)
+			if ret == 0 {
+				cfg := spew.NewDefaultConfig()
+				cfg.Dump(l)
+				cfg.Dump(r)
+				panic("webseed request heap ordering is not stable")
+			}
+			return ret < 0
 		},
 	)
 
@@ -123,7 +161,13 @@ func (cl *Client) updateWebseedRequests() {
 		// handling overhead. Need the value to avoid looking this up again.
 		costKey := elem.costKey
 		panicif.Zero(costKey)
-		if len(plan.byCost[costKey]) >= defaultRequestsPerWebseedHost {
+		if elem.existingWebseedRequest == nil {
+			// Existing requests might be within the allowed discard range.
+			panicif.Eq(elem.priority, PiecePriorityNone)
+		}
+		panicif.True(elem.t.dataDownloadDisallowed.IsSet())
+		panicif.True(elem.t.closed.IsSet())
+		if len(plan.byCost[costKey]) >= webseedHostRequestConcurrency {
 			continue
 		}
 		g.MakeMapIfNil(&plan.byCost)
@@ -133,12 +177,8 @@ func (cl *Client) updateWebseedRequests() {
 	}
 
 	// Cancel any existing requests that are no longer wanted.
-	for key, value := range unwantedExistingRequests {
-		if webseed.PrintDebug {
-			fmt.Printf("cancelling deprioritized existing webseed request %v\n", key)
-		}
-		key.t.slogger().Debug("cancelling deprioritized existing webseed request", "webseedUrl", key.url, "fileIndex", key.fileIndex)
-		value.existingWebseedRequest.Cancel()
+	for _, value := range unwantedExistingRequests {
+		value.existingWebseedRequest.Cancel("deprioritized")
 	}
 
 	printPlan := sync.OnceFunc(func() {
@@ -147,6 +187,8 @@ func (cl *Client) updateWebseedRequests() {
 			//fmt.Println(formatMap(existingRequests))
 		}
 	})
+
+	// TODO: Do we deduplicate requests across different webseeds?
 
 	for costKey, requestKeys := range plan.byCost {
 		for _, requestKey := range requestKeys {
@@ -162,37 +204,72 @@ func (cl *Client) updateWebseedRequests() {
 			peer := t.webSeeds[requestKey.url]
 			panicif.NotEq(peer.hostKey, costKey)
 			printPlan()
-			begin := t.getRequestIndexContainingOffset(requestKey.startOffset)
-			fileEnd := t.endRequestIndexForFileIndex(requestKey.fileIndex)
-			last := begin
-			for {
-				if !t.wantReceiveChunk(last) {
-					break
-				}
-				if last >= fileEnd-1 {
-					break
-				}
-				last++
-			}
-			// Request shouldn't exist if this occurs.
-			panicif.LessThan(last, begin)
-			// Hello C++ my old friend.
-			end := last + 1
-			if webseed.PrintDebug && end != fileEnd {
-				fmt.Printf("shortened webseed request for %v: [%v-%v) to [%v-%v)\n",
-					requestKey.filePath(), begin, fileEnd, begin, end)
-			}
-			panicif.GreaterThan(end, fileEnd)
-			peer.spawnRequest(begin, end)
+
+			debugLogger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+				Level:     slog.LevelDebug,
+				AddSource: true,
+			})).With(
+				"webseedUrl", requestKey.url,
+				"webseedChunkIndex", requestKey.sliceIndex)
+
+			begin := requestKey.startRequest
+			end := t.getWebseedRequestEnd(begin, debugLogger)
+			panicif.LessThanOrEqual(end, begin)
+
+			peer.spawnRequest(begin, end, debugLogger)
 		}
 	}
+}
+
+func (t *Torrent) getWebseedRequestEnd(begin RequestIndex, debugLogger *slog.Logger) RequestIndex {
+	chunkEnd := t.endRequestForAlignedWebseedResponse(begin)
+	if true {
+		// Pending fix to pendingPieces matching piece request order due to missing initial pieces
+		// checks?
+		return chunkEnd
+	}
+	panicif.False(t.wantReceiveChunk(begin))
+	last := begin
+	for {
+		if !t.wantReceiveChunk(last) {
+			break
+		}
+		if last >= chunkEnd-1 {
+			break
+		}
+		last++
+	}
+	end := last + 1
+	panicif.GreaterThan(end, chunkEnd)
+	if webseed.PrintDebug && end != chunkEnd {
+		debugLogger.Debug(
+			"shortened webseed request",
+			"from", endExclusiveString(begin, chunkEnd),
+			"to", endExclusiveString(begin, end))
+	}
+	return end
+}
+
+// Cloudflare caches up to 512 MB responses by default. This is also an alignment. Making this
+// smaller will allow requests to complete a smaller set of files faster.
+var webseedRequestChunkSize = initUIntFromEnv[uint64]("TORRENT_WEBSEED_REQUEST_CHUNK_SIZE", 64<<20, 64)
+
+func (t *Torrent) endRequestForAlignedWebseedResponse(start RequestIndex) RequestIndex {
+	end := min(t.maxEndRequest(), nextMultiple(start, t.chunksPerAlignedWebseedResponse()))
+	panicif.LessThanOrEqual(end, start)
+	return end
+}
+
+func (t *Torrent) chunksPerAlignedWebseedResponse() RequestIndex {
+	// This is the same as webseedRequestChunkSize, but in terms of RequestIndex.
+	return RequestIndex(webseedRequestChunkSize / t.chunkSize.Uint64())
 }
 
 func (cl *Client) dumpCurrentWebseedRequests() {
 	if webseed.PrintDebug {
 		fmt.Println("current webseed requests:")
 		for key, value := range cl.iterCurrentWebseedRequests() {
-			fmt.Printf("\t%v: %v, priority %v\n", key.filePath(), value.existingWebseedRequest, value.priority)
+			fmt.Printf("\t%v: %v, priority %v\n", key, value.existingWebseedRequest, value.priority)
 		}
 	}
 }
@@ -214,27 +291,56 @@ func (me webseedRequestPlan) String() string {
 
 // Distinct webseed request data when different offsets are not allowed.
 type aprioriWebseedRequestKey struct {
-	t         *Torrent
-	fileIndex int
-	url       webseedUrlKey
-}
-
-func (me *aprioriWebseedRequestKey) filePath() string {
-	return me.t.Files()[me.fileIndex].Path()
+	url        webseedUrlKey
+	t          *Torrent
+	sliceIndex RequestIndex
 }
 
 func (me *aprioriWebseedRequestKey) String() string {
-	return fmt.Sprintf("%v from %v", me.filePath(), me.url)
+	return fmt.Sprintf("slice %v from %v", me.sliceIndex, me.url)
 }
 
 // Distinct webseed request when different offsets to the same object are allowed.
 type webseedUniqueRequestKey struct {
 	aprioriWebseedRequestKey
-	startOffset int64
+	startRequest RequestIndex
+}
+
+func (me webseedUniqueRequestKey) endPieceIndex() pieceIndex {
+	return pieceIndex(intCeilDiv(
+		me.t.endRequestForAlignedWebseedResponse(me.startRequest),
+		me.t.chunksPerRegularPiece()))
+}
+
+func (me webseedUniqueRequestKey) mightHavePartialFiles() bool {
+	return me.t.filesInPieceRangeMightBePartial(
+		me.t.pieceIndexOfRequestIndex(me.startRequest),
+		me.endPieceIndex())
+}
+
+func (me webseedUniqueRequestKey) longestFile() (ret g.Option[int64]) {
+	t := me.t
+	firstPiece := t.pieceIndexOfRequestIndex(me.startRequest)
+	firstFileIndex := t.piece(firstPiece).beginFile
+	endFileIndex := t.piece(me.endPieceIndex() - 1).endFile
+	for fileIndex := firstFileIndex; fileIndex < endFileIndex; fileIndex++ {
+		fileLength := t.getFile(fileIndex).length
+		if ret.Ok {
+			ret.Value = max(ret.Value, fileLength)
+		} else {
+			ret.Set(fileLength)
+		}
+	}
+	return
 }
 
 func (me webseedUniqueRequestKey) String() string {
-	return me.aprioriWebseedRequestKey.String() + " at " + fmt.Sprintf("0x%x", me.startOffset)
+	return fmt.Sprintf(
+		"%v at %v:%v",
+		me.aprioriWebseedRequestKey,
+		me.sliceIndex,
+		me.startRequest%me.t.chunksPerAlignedWebseedResponse(),
+	)
 }
 
 // Non-distinct proposed webseed request data.
@@ -261,38 +367,41 @@ func (cl *Client) iterPossibleWebseedRequests() iter.Seq2[webseedUniqueRequestKe
 				value.pieces,
 				func(ih metainfo.Hash, pieceIndex int, orderState requestStrategy.PieceRequestOrderState) bool {
 					t := cl.torrentsByShortHash[ih]
+					if len(t.webSeeds) == 0 {
+						return true
+					}
 					p := t.piece(pieceIndex)
 					cleanOpt := p.firstCleanChunk()
 					if !cleanOpt.Ok {
-						// Could almost return true here, as clearly something is going on with the piece.
-						return false
+						return true
 					}
 					// Pretty sure we want this and not the order state priority. That one is for
 					// client piece request order and ignores other states like hashing, marking
 					// etc. Order state priority would be faster otherwise.
 					priority := p.effectivePriority()
-					for i, e := range p.fileExtents(int64(cleanOpt.Value) * int64(t.chunkSize)) {
-						for url, ws := range t.webSeeds {
-							// Return value from this function (RequestPieceFunc) doesn't terminate
-							// iteration, so propagate that to not handling the yield return value.
-							yield(
-								webseedUniqueRequestKey{
-									aprioriWebseedRequestKey{
-										t:         t,
-										fileIndex: i,
-										url:       url,
-									},
-									e.Start,
+					firstRequest := p.requestIndexBegin() + cleanOpt.Value
+					webseedSliceIndex := firstRequest / t.chunksPerAlignedWebseedResponse()
+					for url, ws := range t.webSeeds {
+						// Return value from this function (RequestPieceFunc) doesn't terminate
+						// iteration, so propagate that to not handling the yield return value.
+						if !yield(
+							webseedUniqueRequestKey{
+								aprioriWebseedRequestKey{
+									t:          t,
+									sliceIndex: webseedSliceIndex,
+									url:        url,
 								},
-								webseedRequestOrderValue{
-									priority: priority,
-									costKey:  ws.hostKey,
-								},
-							)
+								firstRequest,
+							},
+							webseedRequestOrderValue{
+								priority: priority,
+								costKey:  ws.hostKey,
+							},
+						) {
+							return false
 						}
 					}
-					// Pieces iterated here are only to select webseed requests. There's no guarantee they're chosen.
-					return false
+					return true
 				},
 			)
 		}
@@ -302,7 +411,7 @@ func (cl *Client) iterPossibleWebseedRequests() iter.Seq2[webseedUniqueRequestKe
 
 func (cl *Client) updateWebseedRequestsWithReason(reason updateRequestReason) {
 	// Should we wrap this with pprof labels?
-	cl.scheduleImmediateWebseedRequestUpdate()
+	cl.scheduleImmediateWebseedRequestUpdate(reason)
 }
 
 func (cl *Client) iterCurrentWebseedRequests() iter.Seq2[webseedUniqueRequestKey, webseedRequestOrderValue] {
@@ -314,20 +423,21 @@ func (cl *Client) iterCurrentWebseedRequests() iter.Seq2[webseedUniqueRequestKey
 						// This request is done, so don't yield it.
 						continue
 					}
-					off := t.requestIndexBegin(ar.next)
-					opt := t.fileSegmentsIndex.Unwrap().LocateOffset(off)
-					if !opt.Ok {
+					if ar.cancelled.Load() {
+						cl.slogger.Debug("iter current webseed requests: skipped cancelled webseed request")
+						// This should prevent overlapping webseed requests that are just filling
+						// slots waiting to cancel from conflicting.
 						continue
 					}
-					p := t.pieceForOffset(off)
+					p := t.piece(t.pieceIndexOfRequestIndex(ar.next))
 					if !yield(
 						webseedUniqueRequestKey{
 							aprioriWebseedRequestKey{
-								t:         t,
-								fileIndex: opt.Value.Index,
-								url:       url,
+								t:          t,
+								sliceIndex: ar.next / t.chunksPerAlignedWebseedResponse(),
+								url:        url,
 							},
-							opt.Value.Offset,
+							ar.next,
 						},
 						webseedRequestOrderValue{
 							priority:               p.effectivePriority(),
@@ -343,26 +453,58 @@ func (cl *Client) iterCurrentWebseedRequests() iter.Seq2[webseedUniqueRequestKey
 	}
 }
 
-func (cl *Client) scheduleImmediateWebseedRequestUpdate() {
+func (cl *Client) scheduleImmediateWebseedRequestUpdate(reason updateRequestReason) {
 	if !cl.webseedRequestTimer.Stop() {
 		// Timer function already running, let it do its thing.
 		return
 	}
 	// Set the timer to fire right away (this will coalesce consecutive updates without forcing an
 	// update on every call to this method). Since we're holding the Client lock, and we cancelled
-	// the timer and it wasn't active, nobody else should have reset it before us.
+	// the timer, and it wasn't active, nobody else should have reset it before us. Do we need to
+	// introduce a "reason" field here, (albeit Client-level?).
+	cl.webseedUpdateReason = cmp.Or(cl.webseedUpdateReason, reason)
 	panicif.True(cl.webseedRequestTimer.Reset(0))
 }
 
 func (cl *Client) updateWebseedRequestsTimerFunc() {
+	if cl.closed.IsSet() {
+		return
+	}
+	// This won't get set elsewhere if the timer has fired, which it has for us to be here.
+	cl.webseedUpdateReason = cmp.Or(cl.webseedUpdateReason, "timer")
 	cl.lock()
 	defer cl.unlock()
 	cl.updateWebseedRequestsAndResetTimer()
 }
 
 func (cl *Client) updateWebseedRequestsAndResetTimer() {
-	cl.updateWebseedRequests()
-	// Timer should always be stopped before the last call.
+	pprof.Do(context.Background(), pprof.Labels(
+		"reason", string(cl.webseedUpdateReason),
+	), func(_ context.Context) {
+		started := time.Now()
+		reason := cl.webseedUpdateReason
+		cl.webseedUpdateReason = ""
+		cl.updateWebseedRequests()
+		panicif.NotZero(cl.webseedUpdateReason)
+		if webseed.PrintDebug {
+			now := time.Now()
+			fmt.Printf("%v: updateWebseedRequests took %v (reason: %v)\n", now, now.Sub(started), reason)
+		}
+	})
+	// Timer should always be stopped before the last call. TODO: Don't reset timer if there's
+	// nothing to do (no possible requests in update).
 	panicif.True(cl.webseedRequestTimer.Reset(webseedRequestUpdateTimerInterval))
 
+}
+
+type endExclusive[T any] struct {
+	start, end T
+}
+
+func (me endExclusive[T]) String() string {
+	return fmt.Sprintf("[%v-%v)", me.start, me.end)
+}
+
+func endExclusiveString[T any](start, end T) string {
+	return endExclusive[T]{start, end}.String()
 }

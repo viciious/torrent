@@ -46,12 +46,12 @@ type ClientDhtConfig struct {
 	DHTOnQuery func(query *krpc.Msg, source net.Addr) (propagate bool)
 }
 
-// Probably not safe to modify this after it's given to a Client.
+// Probably not safe to modify this after it's given to a Client, or to pass it to multiple Clients.
 type ClientConfig struct {
 	ClientTrackerConfig
 	ClientDhtConfig
 
-	// Store torrent file data in this directory unless .DefaultStorage is
+	// Store torrent file data in this directory unless DefaultStorage is
 	// specified.
 	DataDir string `long:"data-dir" description:"directory to store downloaded torrent data"`
 	// The address to listen for new uTP and TCP BitTorrent protocol connections. DHT shares a UDP
@@ -79,6 +79,8 @@ type ClientConfig struct {
 	// rate-limiting io.Reader minus one. This is likely to be the larger of the main read loop
 	// buffer (~4096), and the requested chunk size (~16KiB, see TorrentSpec.ChunkSize). If limit is
 	// not Inf, and burst is left at 0, the implementation will choose a suitable burst.
+	//
+	// If the field is nil, no rate limiting is applied. And it can't be adjusted dynamically.
 	DownloadRateLimiter *rate.Limiter
 	// Maximum unverified bytes across all torrents. Not used if zero.
 	MaxUnverifiedBytes int64
@@ -109,6 +111,9 @@ type ClientConfig struct {
 	Logger  log.Logger
 	Slogger *slog.Logger
 
+	// Used for torrent metainfo sources only. Falls back to the http.Client created to wrap
+	// WebTransport.
+	MetainfoSourcesClient *http.Client
 	// Used for torrent sources and webseeding if set.
 	WebTransport http.RoundTripper
 	// Defines proxy for HTTP requests, such as for trackers. It's commonly set from the result of
@@ -230,7 +235,6 @@ func NewDefaultClientConfig() *ClientConfig {
 		MaxAllocPeerRequestDataPerConn: 1 << 20,
 		ListenHost:                     func(string) string { return "" },
 		UploadRateLimiter:              unlimited,
-		DownloadRateLimiter:            unlimited,
 		DisableAcceptRateLimiting:      true,
 		DropMutuallyCompletePeers:      true,
 		HeaderObfuscationPolicy: HeaderObfuscationPolicy{
@@ -261,10 +265,16 @@ type HeaderObfuscationPolicy struct {
 
 func (cfg *ClientConfig) setRateLimiterBursts() {
 	// What about chunk size?
-	setRateLimiterBurstIfZero(cfg.UploadRateLimiter, cfg.MaxAllocPeerRequestDataPerConn)
-	setRateLimiterBurstIfZero(
-		cfg.DownloadRateLimiter,
-		min(
-			int(cfg.DownloadRateLimiter.Limit()),
-			defaultDownloadRateLimiterBurst))
+	if cfg.UploadRateLimiter.Burst() == 0 {
+		cfg.UploadRateLimiter.SetBurst(cfg.MaxAllocPeerRequestDataPerConn)
+	}
+	setDefaultDownloadRateLimiterBurstIfZero(cfg.DownloadRateLimiter)
+}
+
+// Returns the download rate.Limit handling the special nil case.
+func EffectiveDownloadRateLimit(l *rate.Limiter) rate.Limit {
+	if l == nil {
+		return rate.Inf
+	}
+	return l.Limit()
 }
