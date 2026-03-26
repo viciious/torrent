@@ -54,7 +54,11 @@ var tcpListenConfig = net.ListenConfig{
 				err = setReusePortSockOpts(fd)
 			}
 			if err == nil && SocketIPTypeOfService != 0 {
-				err = setSockIPTOS(fd, SocketIPTypeOfService)
+				if network == "tcp6" || network == "udp6" {
+					err = setSockIPV6TClass(fd, SocketIPTypeOfService)
+				} else {
+					err = setSockIPTOS(fd, SocketIPTypeOfService)
+				}
 			}
 		})
 		if err != nil {
@@ -95,7 +99,11 @@ func listenTcp(network, address string) (s socket, err error) {
 					err = setReusePortSockOpts(fd)
 				}
 				if err == nil && SocketIPTypeOfService != 0 {
-					err = setSockIPTOS(fd, SocketIPTypeOfService)
+					if network == "tcp6" || network == "udp6" {
+						err = setSockIPV6TClass(fd, SocketIPTypeOfService)
+					} else {
+						err = setSockIPTOS(fd, SocketIPTypeOfService)
+					}
 				}
 			})
 			if err == nil {

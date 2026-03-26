@@ -31,3 +31,7 @@ func setSockNoLinger(fd uintptr) (err error) {
 func setSockIPTOS(fd uintptr, val int) (err error) {
 	return syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IP, syscall.IP_TOS, val)
 }
+
+func setSockIPV6TClass(fd uintptr, val int) (err error) {
+	return syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, syscall.IPV6_TCLASS, val)
+}

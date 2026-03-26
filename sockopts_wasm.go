@@ -14,3 +14,7 @@ func setSockNoLinger(fd uintptr) error {
 func setSockIPTOS(fd uintptr, val int) (err error) {
 	return nil
 }
+
+func setSockIPV6TClass(fd uintptr, val int) (err error) {
+	return nil
+}
